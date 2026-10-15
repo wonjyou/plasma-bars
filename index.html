@@ -1,0 +1,355 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plasma Bars</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #030208; overflow: hidden; }
+  canvas { display: block; width: 100vw; height: 100vh; touch-action: none; cursor: crosshair; }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 28px; text-align: center;
+    font: 11px/1 ui-monospace, "SF Mono", Menlo, monospace; letter-spacing: .32em;
+    text-transform: uppercase; color: rgba(200, 190, 255, .45);
+    pointer-events: none; transition: opacity 1.6s ease;
+  }
+  #err { position: fixed; inset: 0; display: none; place-items: center; color: #ccc; font: 14px system-ui; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hint">pass through the light &nbsp;·&nbsp; click to ignite</div>
+<div id="err">This experiment needs WebGL2.</div>
+
+<script>
+const canvas = document.getElementById('c');
+const hint = document.getElementById('hint');
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false });
+if (!gl) { document.getElementById('err').style.display = 'grid'; throw new Error('WebGL2 unavailable'); }
+
+// Float render targets let the sim store signed velocity and energy > 1.
+// Without them, fall back to RGBA8 and encode values into 0..1.
+const floatOK = !!(gl.getExtension('EXT_color_buffer_float') || gl.getExtension('EXT_color_buffer_half_float'));
+const ENC = floatOK ? 0 : 1;
+
+const VERT = `#version 300 es
+void main() {
+  vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
+  gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);
+}`;
+
+const COMMON = `#version 300 es
+precision highp float;
+uniform float uEnc;
+vec4 dec(vec4 c) { return uEnc > 0.5 ? vec4(c.r * 4.0, c.gb * 2.0 - 1.0, c.a) : c; }
+vec4 enc(vec4 c) { return uEnc > 0.5 ? vec4(c.r / 4.0, c.gb * 0.5 + 0.5, c.a) : c; }
+`;
+
+// Energy field: r = plasma energy, gb = velocity. Advected, diffused, decayed, splatted by pointers.
+const SIM = COMMON + `
+uniform sampler2D uPrev;
+uniform vec2 uSimRes;
+uniform float uAsp, uDt, uDecay, uVDecay;
+uniform int uN;
+uniform vec4 uSeg[8];   // segment start.xy, end.xy (uv)
+uniform vec3 uSp[8];    // velocity.xy, strength
+out vec4 o;
+void main() {
+  vec2 uv = gl_FragCoord.xy / uSimRes;
+  vec2 px = 1.0 / uSimRes;
+  vec4 c = dec(texture(uPrev, uv));
+  // drift with own velocity and rise slowly, like hot gas
+  vec2 back = uv - c.gb * uDt * 0.25 - vec2(0.0, uDt * 0.03);
+  vec4 a = dec(texture(uPrev, back));
+  vec4 nb = dec(texture(uPrev, back + vec2(px.x, 0.0))) + dec(texture(uPrev, back - vec2(px.x, 0.0)))
+          + dec(texture(uPrev, back + vec2(0.0, px.y))) + dec(texture(uPrev, back - vec2(0.0, px.y)));
+  vec4 r = mix(a, nb * 0.25, 0.35);
+  r.r = max(r.r * uDecay - 0.0015, 0.0);
+  r.gb *= uVDecay;
+  vec2 p = vec2(uv.x * uAsp, uv.y);
+  for (int i = 0; i < 8; i++) {
+    if (i >= uN) break;
+    vec2 A = uSeg[i].xy * vec2(uAsp, 1.0);
+    vec2 B = uSeg[i].zw * vec2(uAsp, 1.0);
+    vec2 ab = B - A;
+    float h = clamp(dot(p - A, ab) / max(dot(ab, ab), 1e-6), 0.0, 1.0);
+    float d = length(p - A - ab * h);
+    float g = exp(-d * d / (0.035 * 0.035));
+    r.r += g * uSp[i].z;
+    r.gb += g * uSp[i].xy;
+  }
+  r.r = min(r.r, 3.5);
+  r.gb = clamp(r.gb, -1.0, 1.0);
+  o = enc(r);
+}`;
+
+const RENDER = COMMON + `
+uniform sampler2D uSim;
+uniform vec2 uRes;
+uniform float uTime, uBars, uDpr;
+uniform int uPtrN;
+uniform vec3 uPtr[8];   // x, y (uv), presence
+out vec4 o;
+
+float hash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }
+float hash1(float n) { return fract(sin(n * 127.1) * 43758.5453); }
+float noise(vec3 x) {
+  vec3 i = floor(x), f = fract(x);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x),
+                 mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+             mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x),
+                 mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+}
+float fbm(vec3 p) {
+  float s = 0.0, a = 0.5;
+  for (int i = 0; i < 4; i++) { s += a * noise(p); p = p * 2.03 + 11.7; a *= 0.5; }
+  return s;
+}
+
+void main() {
+  vec2 uv = gl_FragCoord.xy / uRes;
+  float asp = uRes.x / uRes.y;
+  float t = uTime;
+  vec4 s = dec(texture(uSim, uv));
+  float ee = 1.0 - exp(-s.r * 1.4);   // soft 0..1 energy
+  vec2 v = s.gb;
+
+  vec3 P = vec3(uv.x * asp * 3.0, uv.y * 3.0 - t * 0.5, t * 0.3);
+  float n1 = fbm(P);
+  float n2 = fbm(P + vec3(5.2, 1.3, 2.7));
+
+  // bars stay perfectly straight; only the plasma filaments churn
+  float x = uv.x;
+  float y = uv.y + (n2 - 0.5) * 0.03 * ee;
+
+  float id0 = floor(x * uBars);
+  vec3 col = vec3(0.0);
+
+  for (int k = -1; k <= 1; k++) {
+    float id = id0 + float(k);
+    float h = hash1(id + 3.0);
+    float cx = (id + 0.5) / uBars;
+    float dx = (x - cx) * uRes.x / uDpr;   // css px from bar centre
+
+    // bars light up the closer a pointer gets
+    float prox = 0.0, near = 1e4;
+    for (int i = 0; i < 8; i++) {
+      if (i >= uPtrN) break;
+      vec3 pp = uPtr[i];
+      float dist = length(vec2((pp.x - cx) * uRes.x, (uv.y - pp.y) * uRes.y) / uDpr);
+      prox += pp.z * exp(-dist * dist / (2.0 * 170.0 * 170.0));
+      near = min(near, dist);
+    }
+    prox = min(prox, 1.5);
+    // pulse ripples outward along the bar from the pointer
+    float pulse = 0.5 + 0.5 * sin(t * 6.5 - near * 0.035);
+    float boost = prox * (0.45 + 0.55 * pulse);
+
+    float breathe = 0.7 + 0.3 * noise(vec3(id * 7.1, uv.y * 1.5 - t * 0.25, t * 0.15));
+    vec3 base = mix(vec3(0.22, 0.72, 1.0), vec3(0.52, 0.34, 1.0), h);
+    vec3 hot  = mix(vec3(1.0, 0.28, 0.78), vec3(1.0, 0.55, 0.32), h);
+    vec3 c = mix(base, hot, smoothstep(0.05, 0.85, ee));
+
+    // volumetric beam shining down from a source above the screen: it widens
+    // and dims as it falls, and drifting haze breaks it into streaks
+    float ad = abs(dx);
+    float depth = 1.0 - uv.y;                       // 0 at the source, 1 at the floor
+    float spread = 1.0 + 1.3 * depth;
+    float falloff = mix(1.0, 0.4, depth);
+    float haze = 0.55 + 0.45 * fbm(vec3(dx * 0.05 / spread + id * 13.0, uv.y * 2.5 - t * 0.15, t * 0.08));
+    float wb = (13.0 + 4.0 * ee) * spread;
+    float core = exp(-ad * ad / (2.0 * 2.5 * 2.5 * spread));
+    float beam = exp(-ad * ad / (2.0 * wb * wb));
+    float scatter = exp(-ad / (26.0 * spread + 40.0 * boost + 50.0 * ee));
+    float source = exp(-depth * 16.0) * exp(-ad * ad / (2.0 * 28.0 * 28.0));
+
+    vec3 white = vec3(1.0, 0.97, 0.93);
+    vec3 acc = (white * core * (0.3 + 0.8 * ee + 1.5 * boost)
+              + mix(c, white, 0.25 + 0.25 * boost) * beam * (0.62 + 0.9 * ee + 1.6 * boost) * haze * breathe
+              + c * scatter * (0.09 + 0.25 * ee + 0.4 * boost) * haze) * falloff
+             + mix(c, white, 0.5) * source * 0.8;
+
+    // writhing filaments that peel off the bar when energised
+    if (ee > 0.01) {
+      for (int j = 0; j < 3; j++) {
+        float fj = float(j);
+        float sn = noise(vec3(y * 5.0 + fj * 3.1, t * 1.8 + id * 2.3 + fj * 1.7, fj * 4.0 + id)) - 0.5;
+        sn += 0.5 * (noise(vec3(y * 14.0 - t * 4.0 + fj, id * 1.3, t * 2.0 + fj * 9.0)) - 0.5);
+        float off = sn * (40.0 + 70.0 * ee) * ee;
+        float d = abs(dx - off);
+        float flick = smoothstep(0.3, 0.75, noise(vec3(y * 8.0 - t * 6.0, fj * 5.0 + id * 3.0, t)));
+        float strand = 1.0 / (1.0 + d * d * 0.35) + 0.22 / (1.0 + d * 0.15);
+        acc += mix(c, vec3(1.0, 0.92, 1.0), 0.4) * strand * flick * ee * 1.1;
+      }
+    }
+    // Only the 3 nearest bars are summed, so fade each one's light out before
+    // it would be dropped at a slot edge; otherwise the cut shows as a seam.
+    float spacing = uRes.x / uDpr / uBars;
+    col += acc * (1.0 - smoothstep(spacing, spacing * 1.5, abs(dx)));
+  }
+
+  // ionised haze between the bars
+  float wisp = smoothstep(0.35, 0.8, fbm(vec3(uv.x * asp * 7.0, uv.y * 5.0 - t * 1.2, t * 0.7)));
+  col += mix(vec3(0.45, 0.2, 0.95), vec3(1.0, 0.3, 0.6), n2) * ee * (0.03 + 0.16 * wisp);
+  col += mix(vec3(0.010, 0.008, 0.025), vec3(0.025, 0.015, 0.05), uv.y);
+
+  col = 1.0 - exp(-col * 1.15);
+  col += (hash(vec3(gl_FragCoord.xy, fract(t) * 97.0)) - 0.5) * (2.0 / 255.0);
+  o = vec4(col, 1.0);
+}`;
+
+function compile(type, src) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+function program(fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, VERT));
+  gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+  const u = {};
+  const n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) {
+    const name = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, '');
+    u[name] = gl.getUniformLocation(p, name);
+  }
+  return { p, u };
+}
+
+const simProg = program(SIM);
+const renProg = program(RENDER);
+gl.bindVertexArray(gl.createVertexArray());
+
+function makeTarget(w, h) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  if (floatOK) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fb = gl.createFramebuffer();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  if (!ENC) { gl.clearColor(0, 0, 0, 0); } else { gl.clearColor(0, 0.5, 0.5, 0); }
+  gl.clear(gl.COLOR_BUFFER_BIT);
+  return { tex, fb };
+}
+
+const DPR = Math.min(window.devicePixelRatio || 1, 1.5);
+let W, H, simW, simH, sim = [], bars;
+function resize() {
+  W = innerWidth; H = innerHeight;
+  canvas.width = Math.round(W * DPR); canvas.height = Math.round(H * DPR);
+  simW = Math.max(1, Math.ceil(canvas.width / 4)); simH = Math.max(1, Math.ceil(canvas.height / 4));
+  for (const t of sim) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fb); }
+  sim = [makeTarget(simW, simH), makeTarget(simW, simH)];
+  bars = Math.max(5, Math.round(W / 72));
+}
+addEventListener('resize', resize);
+resize();
+
+// ---- pointers (mouse, pen, multi-touch) ----
+const pointers = new Map();
+let lastUser = -1e9;
+function ptr(e) {
+  let p = pointers.get(e.pointerId);
+  const x = e.clientX / W, y = 1 - e.clientY / H;
+  if (!p) { p = { x, y, px: x, py: y, presence: 0, present: true, burst: 0 }; pointers.set(e.pointerId, p); }
+  if (!p.present) { p.px = x; p.py = y; }   // re-entering: don't splat a trail from where it left
+  p.x = x; p.y = y; p.present = true;
+  lastUser = performance.now();
+  hint.style.opacity = 0;
+  return p;
+}
+canvas.addEventListener('pointermove', e => {
+  const evs = e.getCoalescedEvents ? e.getCoalescedEvents() : [];
+  ptr(evs.length ? evs[evs.length - 1] : e);
+});
+canvas.addEventListener('pointerdown', e => { canvas.setPointerCapture(e.pointerId); ptr(e).burst = 2.2; });
+const leave = e => { const p = pointers.get(e.pointerId); if (p) p.present = false; };
+canvas.addEventListener('pointerup', e => { if (e.pointerType !== 'mouse') leave(e); });
+canvas.addEventListener('pointercancel', leave);
+canvas.addEventListener('pointerleave', leave);
+
+// Ghost pointer sweeps through the bars while nobody is interacting.
+const ghost = { x: 0.5, y: 0.5, px: 0.5, py: 0.5, presence: 0, present: false, burst: 0 };
+pointers.set('ghost', ghost);
+
+const seg = new Float32Array(32), sp = new Float32Array(24), ptrU = new Float32Array(24);
+let last = performance.now(), time = 0;
+
+
+function frame(now) {
+  const dt = Math.min((now - last) / 1000, 1 / 30);
+  last = now; time += dt;
+
+  const idle = now - lastUser > 4000;
+  ghost.present = idle;
+  if (idle) {
+    ghost.x = 0.5 + 0.42 * Math.sin(time * 0.47);
+    ghost.y = 0.5 + 0.3 * Math.sin(time * 0.83 + 1.0);
+  }
+
+  let n = 0;
+  for (const [id, p] of pointers) {
+    p.presence += ((p.present ? 1 : 0) - p.presence) * Math.min(1, dt * 4);
+    if (!p.present && p.presence < 0.01 && id !== 'ghost') { pointers.delete(id); continue; }
+    if (n >= 8 || p.presence < 0.01) { p.px = p.x; p.py = p.y; continue; }
+    const vx = (p.x - p.px) / dt, vy = (p.y - p.py) / dt;
+    const speed = Math.hypot(vx * W / H, vy);
+    const str = (p.present ? 0.025 + Math.min(speed * 0.22, 0.6) : 0) + p.burst;
+    seg.set([p.px, p.py, p.x, p.y], n * 4);
+    sp.set([Math.max(-1, Math.min(1, vx * 0.3)), Math.max(-1, Math.min(1, vy * 0.3)), str], n * 3);
+    ptrU.set([p.x, p.y, p.presence], n * 3);
+    p.px = p.x; p.py = p.y; p.burst = 0;
+    n++;
+  }
+
+  // simulate
+  const [src, dst] = sim;
+  gl.useProgram(simProg.p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, dst.fb);
+  gl.viewport(0, 0, simW, simH);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D, src.tex);
+  const su = simProg.u;
+  gl.uniform1i(su.uPrev, 0);
+  gl.uniform1f(su.uEnc, ENC);
+  gl.uniform2f(su.uSimRes, simW, simH);
+  gl.uniform1f(su.uAsp, W / H);
+  gl.uniform1f(su.uDt, dt);
+  gl.uniform1f(su.uDecay, Math.pow(0.985, dt * 60));
+  gl.uniform1f(su.uVDecay, Math.pow(0.95, dt * 60));
+  gl.uniform1i(su.uN, n);
+  gl.uniform4fv(su.uSeg, seg);
+  gl.uniform3fv(su.uSp, sp);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+  sim = [dst, src];
+
+  // render
+  gl.useProgram(renProg.p);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.bindTexture(gl.TEXTURE_2D, dst.tex);
+  const ru = renProg.u;
+  gl.uniform1i(ru.uSim, 0);
+  gl.uniform1f(ru.uEnc, ENC);
+  gl.uniform2f(ru.uRes, canvas.width, canvas.height);
+  gl.uniform1f(ru.uTime, time);
+  gl.uniform1f(ru.uBars, bars);
+  gl.uniform1f(ru.uDpr, DPR);
+  gl.uniform1i(ru.uPtrN, n);
+  gl.uniform3fv(ru.uPtr, ptrU);
+  gl.drawArrays(gl.TRIANGLES, 0, 3);
+
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
