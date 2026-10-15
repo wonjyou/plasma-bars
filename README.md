@@ -2,6 +2,8 @@
 
 A WebGL experiment. Vertical beams of light shine down from above the screen. Move your cursor through them and they ignite into plasma.
 
+Live demo: https://wonjyou.github.io/plasma-bars/
+
 ## How it behaves
 
 Each beam starts at a soft glow at the top edge and widens and dims as it falls, with slow haze drifting through it. When the cursor comes within about 170px, the nearby beams brighten from within and pulse, and each pulse ripples outward along the beam from the cursor.
